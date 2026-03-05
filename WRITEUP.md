@@ -1,105 +1,130 @@
 # Ticket Service Take-Home Write-up
 
-## Branch Mapping
+## Repository / Branch Layout
 
-- `vulnerable-baseline`: original unmodified codebase.
-- `fixed-solution`: bug reproducer + fixes + this write-up.
+- `vulnerable-baseline`: original unmodified forked code (intentionally vulnerable).
+- `fixed-solution`: includes reproducer script, bug fixes, schema hardening, docs, and this write-up.
+
+Important clarification for reviewers: the reproducer script lives on `fixed-solution` by design, and can target a running vulnerable server from `vulnerable-baseline`.
+
+## Deliverable Mapping
+
+1. **Repro script for original bugs**
+  - `src/reproduceOriginalBugs.ts` (on `fixed-solution`)
+2. **Modified codebase with bugs fixed**
+  - `src/ticketService.ts`
+  - `init.sql`
+  - `src/seed.ts`
+3. **Write-up**
+  - `WRITEUP.md`
 
 ## 1) Root Cause Analysis
 
-The overselling and duplicate ticket-number bugs come from a race condition in `purchaseTickets`.
+Both reported issues were caused by a race condition in the original `purchaseTickets` implementation.
 
-In the original implementation:
-1. It reads `ticket_pools` (`SELECT *`) without locking.
-2. It computes ticket numbers from `currentTotal = total - available`.
-3. It inserts tickets one-by-one.
-4. It decrements availability in a separate query.
+Original flow (vulnerable):
+1. Read event pool row (`SELECT * FROM ticket_pools WHERE event_id = $1`) with no lock.
+2. Compute ticket number range from `total - available`.
+3. Insert tickets one-by-one.
+4. Decrement availability in a separate update query.
 
-Under concurrent requests, multiple transactions read the same `available` value at the same time, compute the same ticket range, and both proceed.
+Under concurrent requests, two or more requests can read the same `available` value before any update is committed.
 
-This causes:
-- **Duplicate ticket numbers**: two users can both insert the same `ticket_number` range.
-- **Overselling**: multiple requests each pass the `available < quantity` check, then all decrement availability afterward.
+This leads to:
+- **Duplicate ticket numbers**: concurrent requests compute and insert overlapping ticket ranges.
+- **Overselling**: multiple requests pass availability check and all decrement after issuing.
 
-There is also no DB uniqueness constraint on `(event_id, ticket_number)`, so duplicates are accepted silently.
+Additionally, there was no DB uniqueness constraint on `(event_id, ticket_number)`, so duplicates were not blocked at the database layer.
 
-## 2) Reproduction Script
+## 2) How to Reproduce on Original Code
 
-I added `src/reproduceOriginalBugs.ts`.
+Run vulnerable service from `vulnerable-baseline` and run reproducer from `fixed-solution`.
 
-What it does:
-- Resets a test event with a tiny pool (`total=32`, `available=32`).
-- Fires many concurrent `POST /purchase` requests (`quantity=8` each).
-- Reads DB state and checks:
-  - issued count vs total and available
-  - `COUNT(*)` vs `COUNT(DISTINCT ticket_number)`
-  - duplicate ticket numbers list
-
-Run:
+### Terminal A (vulnerable server)
 
 ```bash
+git switch vulnerable-baseline
+docker-compose up -d
+npm install
+npm run seed
+npm run dev
+```
+
+### Terminal B (reproducer)
+
+```bash
+git switch fixed-solution
+npm install
 npm run repro
 ```
 
-Expected against vulnerable code: it reliably reports both overselling and duplicate ticket numbers.
+Expected vulnerable output:
+- `Reproduced both bugs: overselling and duplicate ticket numbers`
+
+If reproduction is flaky on a slower machine:
+
+```bash
+cross-env REPRO_ATTEMPTS=20 REPRO_CONCURRENT_REQUESTS=120 npm run repro
+```
 
 ## 3) Fix Implemented
 
-### Application-level fix
+### Application-level fix (`src/ticketService.ts`)
 
-In `src/ticketService.ts`, I changed purchase allocation to a single transaction with row-level locking:
+Ticket issuance is now atomic per event using one DB transaction:
 - `BEGIN`
-- `SELECT ... FROM ticket_pools WHERE event_id = $1 FOR UPDATE`
-- Validate availability while row is locked
-- Insert full ticket range in one SQL statement using `generate_series`
+- `SELECT ... FOR UPDATE` on the event row
+- Validate remaining availability while locked
+- Insert all ticket numbers in one statement via `generate_series`
 - Update `available`
-- `COMMIT` (or `ROLLBACK` on error)
+- `COMMIT` (or `ROLLBACK` on failure)
 
-This serializes purchases per event and guarantees no two concurrent requests can allocate overlapping ticket ranges.
+This prevents overlapping allocations and overselling caused by concurrent requests for the same event.
 
-### Database-level safety fix
+### Database-level fix (`init.sql`, `src/seed.ts`)
 
-Added schema protections:
-- Unique index on `(event_id, ticket_number)`
-- Check constraints on `ticket_pools`:
+Added hard safety constraints:
+- Unique index: `(event_id, ticket_number)`
+- Check constraints:
   - `total >= 0`
   - `available >= 0`
   - `available <= total`
 
-Added in:
-- `init.sql` for fresh DB bootstrap
-- `src/seed.ts` so existing local DBs get the same constraints/index idempotently
+`src/seed.ts` also applies these constraints/index idempotently for existing local databases.
 
-## 4) Tradeoffs
+## 4) Post-fix Validation
 
-### Why this approach
-- Minimal external behavior change (same API and response shape)
-- Strong correctness guarantees with standard PostgreSQL transaction semantics
-- Small, maintainable code change
-
-### Cost
-- Requests for the same event now serialize on the locked row, which can increase latency under extreme contention for one event.
-- Requests for different events still run concurrently.
-
-## 5) Bonus: Scalable Path for 10k+ RPS / Multi-Instance
-
-For very high throughput across many service instances:
-1. Keep DB uniqueness constraints as final correctness guardrail.
-2. Replace per-request row-lock flow with **atomic range reservation**:
-   - Add `next_ticket_number` to event pool.
-   - Do one atomic `UPDATE ... SET next_ticket_number = next_ticket_number + quantity, available = available - quantity WHERE available >= quantity RETURNING old/new range`.
-   - Then bulk insert reserved range.
-3. Optionally partition `issued_tickets` by `event_id` or time for write scaling.
-4. Use connection pooling tuned for DB cores and workload.
-
-This reduces lock hold time and minimizes round trips while preserving correctness.
-
-## 6) Post-fix Validation
-
-Run:
+Run fixed service and fixed validation script:
 
 ```bash
+git switch fixed-solution
+npm run seed
+npm run dev
 npm run repro:fixed
 ```
 
-Expected: no overselling and no duplicate ticket numbers observed.
+Expected fixed output:
+- `No overselling or duplicate ticket numbers observed`
+
+## 5) Tradeoffs
+
+### Benefits
+- Preserves existing API behavior.
+- Correctness guaranteed with standard PostgreSQL transaction semantics.
+- Small and maintainable change footprint.
+
+### Cost
+- Requests for the same event serialize on row lock under heavy contention.
+- Different events still process concurrently.
+
+## 6) Bonus: Scaling Direction for 10k+ RPS / Multi-Instance
+
+For higher throughput while preserving correctness:
+1. Keep DB uniqueness/check constraints as final guardrails.
+2. Move to atomic range reservation model:
+  - Maintain `next_ticket_number` per event.
+  - Use one atomic conditional update to reserve a range and decrement availability.
+3. Bulk insert reserved tickets.
+4. Partition `issued_tickets` and tune connection pools.
+
+This reduces lock hold time and round trips while maintaining strict ticket uniqueness and stock correctness.
