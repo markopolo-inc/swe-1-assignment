@@ -1,5 +1,68 @@
 # Ticket Service - Environment Setup
 
+## Assignment Quick Start (Reviewer)
+
+This repository uses two branches for the assignment:
+
+- `vulnerable-baseline`: original unmodified code from the fork (intentionally vulnerable, no repro script).
+- `fixed-solution`: contains the bug reproducer, fix, and write-up.
+
+### Fastest way to verify all deliverables
+
+Use two working folders at the same time:
+
+1. Vulnerable service checkout (`vulnerable-baseline`) in one folder.
+2. Fixed checkout (`fixed-solution`) in another folder.
+
+Then run:
+
+**Terminal A (vulnerable service):**
+
+```bash
+cd <path-to-vulnerable-baseline-checkout>
+docker-compose up -d
+npm install
+npm run seed
+npm run dev
+```
+
+**Terminal B (reproducer from fixed-solution):**
+
+```bash
+cd <path-to-fixed-solution-checkout>
+npm install
+npm run repro
+```
+
+Expected vulnerable result:
+- Prints `Reproduced both bugs: overselling and duplicate ticket numbers`
+
+Now validate the fix:
+
+**Terminal C (fixed service):**
+
+```bash
+cd <path-to-fixed-solution-checkout>
+npm run seed
+npm run dev
+```
+
+**Terminal D (fixed validation):**
+
+```bash
+cd <path-to-fixed-solution-checkout>
+npm run repro:fixed
+```
+
+Expected fixed result:
+- Prints `No overselling or duplicate ticket numbers observed`
+
+If vulnerable reproduction is flaky on a slower machine:
+
+```bash
+cross-env REPRO_ATTEMPTS=20 REPRO_CONCURRENT_REQUESTS=120 npm run repro
+```
+
 ## Prerequisites
 
 - Node.js 18+ and npm
@@ -86,6 +149,8 @@ curl -X POST http://localhost:3000/purchase \
 
 - `vulnerable-baseline`: points to the original unmodified codebase (for proving the bug).
 - `fixed-solution`: contains the reproduction script, bug fix, schema hardening, and write-up.
+
+Note: the reproducer script exists on `fixed-solution` by design, and targets a running server from `vulnerable-baseline` when proving the original bug.
 
 ### Suggested reviewer flow
 
